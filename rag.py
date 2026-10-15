@@ -37,10 +37,13 @@ LLM_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct'
 CHUNK_WORDS, OVERLAP_WORDS = 150, 30   # chunk size / overlap in words
 TOP_K_CANDIDATES = 30                  # candidates taken from BM25 and from vectors
 TOP_K_CONTEXT = 3                      # chunks given to the LLM
-K_BY_TYPE = {}                         # per-type override, e.g. {'yesno': 4, 'mcq': 4} (no generation -> cheaper)
+K_BY_TYPE = {'mcq': 4}                 # per-type override: MCQ +2 right / 0 wrong on 89 samples (+45% time on MCQ)
 ALLOW_KNOWLEDGE = False                # let the LLM use its own knowledge when the context lacks the answer
 YES_MARGIN = 2.0                       # answer "yes" only if logit(yes) - logit(no) > YES_MARGIN (tuned on 89 sample yes/no: 0.72 -> 0.83)
-DEADLINE_MIN = 110                     # contest: 100 questions in 120 min -> switch to fast mode after this
+DEADLINE_MIN = 110                     # fast-mode guard: minutes after setup() started ...
+DEADLINE_AT = '2026-10-16 17:50'       # ... or this Bangkok clock time on contest day, whichever is earlier.
+                                       # A run that STARTS after DEADLINE_AT (e.g. a later re-run) ignores it,
+                                       # so a re-run reproduces the normal answers.
 
 QUERY_PREFIX = 'Represent this sentence for searching relevant passages: '
 FALLBACK = {'yesno': 'no', 'mcq': 'A', 'number': '0', 'text': ''}
@@ -80,8 +83,9 @@ def chunk_doc(doc):
 
 
 def doc_id_of(name):
-    """'Copy of 057_peron...pdf' -> 57"""
-    m = re.search(r'(\d+)_', name)
+    """document ID (1-150) from the file name: '057_peron.pdf', 'Copy of 057_peron.pdf', '57 - peron.pdf' -> 57"""
+    base = re.sub(r'^copy of\s+', '', os.path.basename(name), flags=re.I)
+    m = re.match(r'\s*0*(\d{1,3})(?!\d)', base) or re.search(r'(?<!\d)0*(\d{1,3})(?!\d)', base)
     return int(m.group(1)) if m else -1
 
 
@@ -323,6 +327,18 @@ def save_csv(df, path):
     os.replace(tmp, path)
 
 
+def contest_deadline(run_start):
+    """unix time by which all answers must be written (fast mode kicks in if we would miss it)"""
+    from datetime import datetime, timedelta, timezone
+    limit = run_start + DEADLINE_MIN * 60
+    if not DEADLINE_AT:
+        return limit
+    at = datetime.strptime(DEADLINE_AT, '%Y-%m-%d %H:%M').replace(tzinfo=timezone(timedelta(hours=7))).timestamp()
+    if run_start >= at:                    # re-run after the contest: no time pressure, reproduce normal answers
+        return float('inf')
+    return min(limit, at)
+
+
 def load_progress(path):
     """rows saved by an earlier (interrupted) run; [] if missing or unreadable"""
     if not os.path.exists(path):
@@ -466,21 +482,25 @@ class RAGSystem:
         id_col = 'question_id' if 'question_id' in qdf.columns else \
             next((c for c in qdf.columns if c.lower() in ('id', 'qid', 'no')), None)
 
-        answers, docs = {}, {}
+        answers, docs, qtexts = {}, {}, {}
         for r in load_progress(partial_csv):              # resume after a disconnect
-            answers[int(r['idx'])], docs[int(r['idx'])] = r['answer'], r['doc']
+            i = int(r['idx'])
+            if i < len(qdf) and r.get('question', '') == qdf[q_col][i]:   # ignore leftovers of another file
+                answers[i], docs[i], qtexts[i] = r['answer'], r['doc'], r['question']
 
+        deadline = contest_deadline(self.run_start)
         todo = [i for i in range(len(qdf)) if i not in answers]
-        print(f'{len(qdf)} questions, {len(todo)} to answer')
+        print(f'{len(qdf)} questions, {len(todo)} to answer; must finish within '
+              f'{(deadline - time.time()) / 60:.0f} min')
         t0, fast = time.time(), False
         for j, i in enumerate(todo):
             q = qdf[q_col][i]
-            if not fast and j >= 1:                       # deadline guard
-                projected = (time.time() - self.run_start) + (len(todo) - j) * (time.time() - t0) / j
-                if projected > DEADLINE_MIN * 60:
+            if not fast and j >= 1:                       # deadline guard (emergency only)
+                projected = time.time() + (len(todo) - j) * (time.time() - t0) / j
+                if projected > deadline:
                     fast = True
-                    print(f'!!! projected {projected / 60:.0f} min > {DEADLINE_MIN} -> FAST MODE '
-                          f'for the last {len(todo) - j} questions')
+                    print(f'!!! projected finish {(projected - deadline) / 60:.0f} min past the deadline '
+                          f'-> FAST MODE for the last {len(todo) - j} questions')
             try:
                 qt, a, used, _ = self.answer_question(q, fast=fast)
                 doc = self.pick_doc_id(used)
@@ -492,9 +512,10 @@ class RAGSystem:
                 except Exception:
                     doc = -1
                 print(f'{i}: ERROR {e!r} -> fallback')
-            answers[i], docs[i] = a, doc
+            answers[i], docs[i], qtexts[i] = a, doc, q
             save_csv(pd.DataFrame({'idx': list(answers), 'answer': list(answers.values()),
-                                   'doc': [docs[k] for k in answers]}), partial_csv)
+                                   'doc': [docs[k] for k in answers],
+                                   'question': [qtexts[k] for k in answers]}), partial_csv)
             print(f'{i}: [{qt}] {a!r} doc={doc}  ({(time.time() - self.run_start) / 60:.1f} min'
                   f'{", FAST" if fast else ""})')
 
@@ -504,7 +525,7 @@ class RAGSystem:
         out['answer_text'] = [answers[i] for i in range(len(qdf))]
         out['document_id'] = [docs[i] for i in range(len(qdf))]
         save_csv(out, answer_csv)
-        print('saved', answer_csv)
+        print(f'saved {answer_csv}  (total {(time.time() - self.run_start) / 60:.1f} min since setup started)')
         return out
 
     # ---- evaluation with the contest formula
@@ -559,6 +580,21 @@ def summarize(eval_csv):
     print(f"\nanswer {res['ans_score'].mean():.3f} + document_id {res['doc_score'].mean():.3f} "
           f"= {total:.3f} / 2 per question  (n={len(res)}, {res['sec'].mean():.1f}s/question)")
     return res
+
+
+def score_answers(answer_csv, gold_csv):
+    """grade an answer.csv like the instructor: 2 points per question (answer_text + document_id)"""
+    ans = pd.read_csv(answer_csv, dtype=str, keep_default_na=False)
+    gold = pd.read_csv(gold_csv, dtype=str, keep_default_na=False)
+    m = gold.merge(ans, on='question_id', how='left', suffixes=('_gold', '')).fillna('')
+    m['gtype'] = m['answer_text_gold'].map(gold_type)
+    m['ans'] = [answer_score(p, g) for p, g in zip(m['answer_text'], m['answer_text_gold'])]
+    m['doc'] = [float(str(p).strip() == str(int(float(g)))) if g else 0.0
+                for p, g in zip(m['document_id'], m['document_id_gold'])]
+    print(m.groupby('gtype')[['ans', 'doc']].agg(['mean', 'size']).round(3))
+    print(f"\nscore {m['ans'].sum() + m['doc'].sum():.1f} / {2 * len(m)}  "
+          f"(answer {m['ans'].sum():.1f} + document_id {m['doc'].sum():.0f})")
+    return m
 
 
 def compare(base_csv, new_csv):
