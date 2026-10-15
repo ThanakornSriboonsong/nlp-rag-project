@@ -311,6 +311,25 @@ INSTRUCTIONS = {
 YES_NO = {'yes': ['yes', 'Yes', ' yes', ' Yes'], 'no': ['no', 'No', ' no', ' No']}
 
 
+def save_csv(df, path):
+    """write to a temp file, then rename: a crash or power loss never leaves a half-written file"""
+    tmp = path + '.tmp'
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def load_progress(path):
+    """rows saved by an earlier (interrupted) run; [] if missing or unreadable"""
+    if not os.path.exists(path):
+        return []
+    try:
+        return pd.read_csv(path, dtype=str, keep_default_na=False).to_dict('records')
+    except Exception as e:
+        os.replace(path, path + '.broken')
+        print(f'could not read {path} ({e!r}); moved it to .broken and starting over')
+        return []
+
+
 # ----------------------------------------------------------------------------- the system
 class RAGSystem:
     def __init__(self, project_dir='.', threads=None):
@@ -443,10 +462,8 @@ class RAGSystem:
             next((c for c in qdf.columns if c.lower() in ('id', 'qid', 'no')), None)
 
         answers, docs = {}, {}
-        if os.path.exists(partial_csv):                   # resume after a disconnect
-            p = pd.read_csv(partial_csv, dtype=str, keep_default_na=False)
-            answers = dict(zip(p['idx'].astype(int), p['answer']))
-            docs = dict(zip(p['idx'].astype(int), p['doc']))
+        for r in load_progress(partial_csv):              # resume after a disconnect
+            answers[int(r['idx'])], docs[int(r['idx'])] = r['answer'], r['doc']
 
         todo = [i for i in range(len(qdf)) if i not in answers]
         print(f'{len(qdf)} questions, {len(todo)} to answer')
@@ -471,8 +488,8 @@ class RAGSystem:
                     doc = -1
                 print(f'{i}: ERROR {e!r} -> fallback')
             answers[i], docs[i] = a, doc
-            pd.DataFrame({'idx': list(answers), 'answer': list(answers.values()),
-                          'doc': [docs[k] for k in answers]}).to_csv(partial_csv, index=False)
+            save_csv(pd.DataFrame({'idx': list(answers), 'answer': list(answers.values()),
+                                   'doc': [docs[k] for k in answers]}), partial_csv)
             print(f'{i}: [{qt}] {a!r} doc={doc}  ({(time.time() - self.run_start) / 60:.1f} min'
                   f'{", FAST" if fast else ""})')
 
@@ -481,7 +498,7 @@ class RAGSystem:
             out['question_id'] = qdf[id_col]
         out['answer_text'] = [answers[i] for i in range(len(qdf))]
         out['document_id'] = [docs[i] for i in range(len(qdf))]
-        out.to_csv(answer_csv, index=False)
+        save_csv(out, answer_csv)
         print('saved', answer_csv)
         return out
 
@@ -498,8 +515,7 @@ class RAGSystem:
         elif n:
             gold = gold.sample(min(n, len(gold)), random_state=seed)
 
-        rows = pd.read_csv(out_csv, dtype=str, keep_default_na=False).to_dict('records') \
-            if os.path.exists(out_csv) else []
+        rows = load_progress(out_csv)
         done = {r['id'] for r in rows}
         t0, k = time.time(), 0
         for _, r in gold.iterrows():
@@ -518,7 +534,7 @@ class RAGSystem:
                          'doc': doc, 'gold_doc': gdoc, 'doc_score': float(doc == gdoc),
                          'yn_diff': '' if diff is None else round(diff, 3), 'sec': round(time.time() - t, 1),
                          'question': r['question_text'][:150]})
-            pd.DataFrame(rows).to_csv(out_csv, index=False)
+            save_csv(pd.DataFrame(rows), out_csv)
             k += 1
             print(f"{len(rows)}/{len(gold)} [{qt}] pred={pred!r} gold={r['answer_text']!r} "
                   f"score={rows[-1]['ans_score']:.2f} doc={'ok' if doc == gdoc else 'X'}  "
@@ -543,12 +559,13 @@ if __name__ == '__main__':
     ap.add_argument('command', choices=['eval', 'answer', 'summary'])
     ap.add_argument('--project-dir', default=os.environ.get('RAG_PROJECT_DIR', '.'))
     ap.add_argument('--n', type=int, default=None, help='eval: random sample size (default: all)')
+    ap.add_argument('--threads', type=int, default=None, help='CPU threads (default: all cores)')
     ap.add_argument('--out', default=None, help='eval: results csv (resumes if it exists)')
     args = ap.parse_args()
     if args.command == 'summary':
         summarize(args.out or os.path.join(args.project_dir, 'output', 'eval_local.csv'))
     else:
-        rag = RAGSystem(args.project_dir)
+        rag = RAGSystem(args.project_dir, threads=args.threads)
         rag.setup()
         if args.command == 'eval':
             rag.evaluate(n=args.n, out_csv=args.out)
