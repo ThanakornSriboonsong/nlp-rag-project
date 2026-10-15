@@ -1,0 +1,8 @@
+# Colab already has torch, transformers, pandas, numpy
+torch
+transformers
+sentence-transformers
+rank_bm25
+pypdf
+pandas
+numpy

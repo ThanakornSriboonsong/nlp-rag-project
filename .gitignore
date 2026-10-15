@@ -1,0 +1,11 @@
+# data from the instructor / Google Drive (not part of the code)
+docs/
+data/
+output/
+*.pdf
+*.csv
+# local environment
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
