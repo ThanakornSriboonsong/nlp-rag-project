@@ -346,7 +346,7 @@ class RAGSystem:
         from transformers import AutoTokenizer, AutoModelForCausalLM
         t = time.time()
         self.tok = AutoTokenizer.from_pretrained(LLM_MODEL)
-        self.llm = AutoModelForCausalLM.from_pretrained(LLM_MODEL, torch_dtype=torch.float32,
+        self.llm = AutoModelForCausalLM.from_pretrained(LLM_MODEL, dtype=torch.float32,
                                                         low_cpu_mem_usage=True).eval()
         print(f'LLM loaded ({time.time() - t:.0f}s)')
 
