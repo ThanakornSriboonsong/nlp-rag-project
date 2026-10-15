@@ -37,7 +37,7 @@ LLM_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct'
 CHUNK_WORDS, OVERLAP_WORDS = 150, 30   # chunk size / overlap in words
 TOP_K_CANDIDATES = 30                  # candidates taken from BM25 and from vectors
 TOP_K_CONTEXT = 3                      # chunks given to the LLM
-YES_MARGIN = 0.0                       # answer "yes" only if logit(yes) - logit(no) > YES_MARGIN
+YES_MARGIN = 2.0                       # answer "yes" only if logit(yes) - logit(no) > YES_MARGIN (tuned on 89 sample yes/no: 0.72 -> 0.83)
 DEADLINE_MIN = 110                     # contest: 100 questions in 120 min -> switch to fast mode after this
 
 QUERY_PREFIX = 'Represent this sentence for searching relevant passages: '
