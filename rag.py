@@ -37,6 +37,8 @@ LLM_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct'
 CHUNK_WORDS, OVERLAP_WORDS = 150, 30   # chunk size / overlap in words
 TOP_K_CANDIDATES = 30                  # candidates taken from BM25 and from vectors
 TOP_K_CONTEXT = 3                      # chunks given to the LLM
+K_BY_TYPE = {}                         # per-type override, e.g. {'yesno': 4, 'mcq': 4} (no generation -> cheaper)
+ALLOW_KNOWLEDGE = False                # let the LLM use its own knowledge when the context lacks the answer
 YES_MARGIN = 2.0                       # answer "yes" only if logit(yes) - logit(no) > YES_MARGIN (tuned on 89 sample yes/no: 0.72 -> 0.83)
 DEADLINE_MIN = 110                     # contest: 100 questions in 120 min -> switch to fast mode after this
 
@@ -298,6 +300,9 @@ def answer_score(pred, gold):
 
 # ----------------------------------------------------------------------------- prompts
 SYSTEM = 'You are a precise assistant. Answer using only the information in the context.'
+SYSTEM_KNOWLEDGE = ('You are a precise assistant. Answer using the information in the context. '
+                    'If the context does not contain the answer (for example a general NLP or machine '
+                    'learning concept), answer from your own knowledge.')
 INSTRUCTIONS = {
     'yesno': 'Answer with only yes or no. Answer yes only if the context clearly confirms every detail '
              '(names, numbers, days, amounts, roles). If any detail is different or not stated, answer no.',
@@ -384,7 +389,7 @@ class RAGSystem:
 
     # ---- LLM calls
     def build_prompt(self, context, question, qtype):
-        msgs = [{'role': 'system', 'content': SYSTEM},
+        msgs = [{'role': 'system', 'content': SYSTEM_KNOWLEDGE if ALLOW_KNOWLEDGE else SYSTEM},
                 {'role': 'user', 'content': f'Context:\n{context}\n\nQuestion: {question}\n\n{INSTRUCTIONS[qtype]}'}]
         return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
@@ -421,9 +426,9 @@ class RAGSystem:
     # ---- one question
     def answer_question(self, q, qtype=None, fast=False):
         """-> (type, answer, retrieved_chunks, yes_no_diff); fast=True: 2 chunks + 16 new tokens"""
-        k = 2 if fast else TOP_K_CONTEXT
         new_tokens = 16 if fast else 24
         qtype = qtype or detect_type(q)
+        k = 2 if fast else K_BY_TYPE.get(qtype, TOP_K_CONTEXT)
         stem, opts = split_mcq(q)
         ctx = lambda cs: '\n\n'.join(f'[{i + 1}] {c["text"]}' for i, c in enumerate(cs))
         if qtype == 'mcq' and opts:
@@ -503,13 +508,15 @@ class RAGSystem:
         return out
 
     # ---- evaluation with the contest formula
-    def evaluate(self, gold_csv=None, n=None, ids=None, out_csv=None, seed=0):
+    def evaluate(self, gold_csv=None, n=None, ids=None, out_csv=None, seed=0, types=None):
         """answers the sample questions and scores them like the grader (2 points per question).
-        Saves after every question and resumes from out_csv."""
+        Saves after every question and resumes from out_csv. types: e.g. ['yesno', 'mcq'] (by gold answer)"""
         gold_csv = gold_csv or os.path.join(self.data_dir, 'question_and_answer.csv')
         out_csv = out_csv or os.path.join(self.output_dir, 'eval_local.csv')
         gold = pd.read_csv(gold_csv, dtype=str, keep_default_na=False)
         gold = gold[~gold['question_id'].isin(BAD_GOLD_IDS)]
+        if types:
+            gold = gold[gold['answer_text'].map(gold_type).isin(types)]
         if ids is not None:
             gold = gold[gold['question_id'].isin({str(i) for i in ids})]
         elif n:
@@ -554,20 +561,55 @@ def summarize(eval_csv):
     return res
 
 
+def compare(base_csv, new_csv):
+    """score difference between two eval runs on the questions both of them answered"""
+    a = pd.read_csv(base_csv, dtype={'id': str}, keep_default_na=False).set_index('id')
+    b = pd.read_csv(new_csv, dtype={'id': str}, keep_default_na=False).set_index('id')
+    ids = a.index.intersection(b.index).difference(list(BAD_GOLD_IDS))
+    a, b = a.loc[ids], b.loc[ids]
+    a['pts'] = a['ans_score'] + a['doc_score']
+    b['pts'] = b['ans_score'] + b['doc_score']
+    t = pd.DataFrame({'n': a.groupby('gtype').size(),
+                      'base': a.groupby('gtype')['pts'].mean(), 'new': b.groupby('gtype')['pts'].mean(),
+                      'base_sec': a.groupby('gtype')['sec'].mean(), 'new_sec': b.groupby('gtype')['sec'].mean()})
+    print(t.round(3))
+    d = b['pts'] - a['pts']
+    print(f"\n{len(ids)} questions: {a['pts'].mean():.3f} -> {b['pts'].mean():.3f} points/question  "
+          f"(better {(d > 0.01).sum()}, worse {(d < -0.01).sum()}; "
+          f"{a['sec'].mean():.1f}s -> {b['sec'].mean():.1f}s per question)")
+    for i in d[d.abs() > 0.01].sort_values().index:
+        print(f"  {i:>4} [{a.loc[i, 'gtype']}] {a.loc[i, 'pred']!r} -> {b.loc[i, 'pred']!r}  gold={a.loc[i, 'gold']!r}"
+              f"  doc {a.loc[i, 'doc']}->{b.loc[i, 'doc']} (gold {a.loc[i, 'gold_doc']})")
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('command', choices=['eval', 'answer', 'summary'])
+    ap.add_argument('command', choices=['eval', 'answer', 'summary', 'compare'])
     ap.add_argument('--project-dir', default=os.environ.get('RAG_PROJECT_DIR', '.'))
     ap.add_argument('--n', type=int, default=None, help='eval: random sample size (default: all)')
+    ap.add_argument('--types', default=None, help='eval: only these gold types, e.g. yesno,mcq')
     ap.add_argument('--threads', type=int, default=None, help='CPU threads (default: all cores)')
     ap.add_argument('--out', default=None, help='eval: results csv (resumes if it exists)')
+    ap.add_argument('--base', default=None, help='compare: baseline results csv (compared with --out)')
+    # experiment switches (defaults = the settings above)
+    ap.add_argument('--rerank', default=None, help='cross-encoder model name')
+    ap.add_argument('--k-yn-mcq', type=int, default=None, help='chunks for yes/no + MCQ questions')
+    ap.add_argument('--knowledge', action='store_true', help='allow the LLM to use its own knowledge')
     args = ap.parse_args()
+    if args.rerank:
+        RERANK_MODEL = args.rerank
+    if args.k_yn_mcq:
+        K_BY_TYPE.update(yesno=args.k_yn_mcq, mcq=args.k_yn_mcq)
+    if args.knowledge:
+        ALLOW_KNOWLEDGE = True
     if args.command == 'summary':
         summarize(args.out or os.path.join(args.project_dir, 'output', 'eval_local.csv'))
+    elif args.command == 'compare':
+        compare(args.base, args.out)
     else:
         rag = RAGSystem(args.project_dir, threads=args.threads)
         rag.setup()
         if args.command == 'eval':
-            rag.evaluate(n=args.n, out_csv=args.out)
+            rag.evaluate(n=args.n, out_csv=args.out, types=args.types.split(',') if args.types else None)
         else:
             rag.answer_file()
