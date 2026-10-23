@@ -39,9 +39,10 @@ TOP_K_CANDIDATES = 30                  # candidates taken from BM25 and from vec
 TOP_K_CONTEXT = 3                      # chunks given to the LLM
 K_BY_TYPE = {'mcq': 4}                 # per-type override: MCQ +2 right / 0 wrong on 89 samples (+45% time on MCQ)
 ALLOW_KNOWLEDGE = False                # let the LLM use its own knowledge when the context lacks the answer
+K_RETRY = 6                            # chunks for a second look when the model says "not specified"
 YES_MARGIN = 2.0                       # answer "yes" only if logit(yes) - logit(no) > YES_MARGIN (tuned on 89 sample yes/no: 0.72 -> 0.83)
 DEADLINE_MIN = 110                     # fast-mode guard: minutes after setup() started ...
-DEADLINE_AT = '2026-10-16 17:50'       # ... or this Bangkok clock time on contest day, whichever is earlier.
+DEADLINE_AT = '2026-11-06 17:50'       # ... or this Bangkok clock time on contest day, whichever is earlier.
                                        # A run that STARTS after DEADLINE_AT (e.g. a later re-run) ignores it,
                                        # so a re-run reproduces the normal answers.
 
@@ -198,6 +199,19 @@ def safe_eval(expr):
     return ev(ast.parse(expr, mode='eval').body)
 
 
+NOT_FOUND_RE = re.compile(r"\bnot (?:specified|mentioned|provided|stated|given|found|available|included|listed|clear)\b"
+                          r"|\bno (?:information|mention|data|details?)\b|\bcannot be (?:determined|found)\b"
+                          r"|\bdoes not (?:say|mention|specify|state)\b|\bunknown\b|^\s*n/?a\s*$", re.I)
+
+
+def is_not_found(raw, qtype):
+    """the model says the context does not contain the answer (or gave no number for a number question)"""
+    if NOT_FOUND_RE.search(raw):
+        return True
+    return qtype == 'number' and not re.search(r'\d', raw) and \
+        not any(w in raw.lower().split() for w in WORD_NUM)
+
+
 def number_answer(raw):
     """model output -> digits; computes "99*12" style expressions"""
     s = raw.replace(',', '').replace('×', '*').replace('÷', '/')
@@ -339,6 +353,44 @@ def contest_deadline(run_start):
     return min(limit, at)
 
 
+class TimeBudget:
+    """Chooses normal or fast mode for EACH question so that all questions finish before the deadline.
+
+    Contest lesson (16 Oct): the old guard judged from the first question only (which is slow: warm-up),
+    switched to fast mode for the remaining 99 questions and never switched back - 32 minutes were left unused.
+    Now: the first question is ignored, the decision waits for MIN_SAMPLES normal answers, and it is re-made
+    before every question: answer normally as long as the rest could still be finished in fast mode."""
+    MIN_SAMPLES = 8          # normal answers needed before trusting the speed estimate
+    SAFETY = 1.15            # pretend questions take 15% longer than measured
+    FAST_RATIO = 0.7         # fast/normal time ratio until fast answers have been measured
+    FLOOR_SEC = 20           # before MIN_SAMPLES: switch only if even 20 s/question would miss the deadline
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.times = {'normal': [], 'fast': []}
+        self.seen_first = False
+
+    def record(self, mode, seconds):
+        if not self.seen_first:          # first question = warm-up (lazy init, caches): not representative
+            self.seen_first = True
+            return
+        self.times[mode].append(seconds)
+
+    def estimate(self, mode):
+        t = self.times[mode]
+        if mode == 'fast' and len(t) < 3:
+            return self.estimate('normal') * self.FAST_RATIO
+        return float(np.mean(t[-30:]))
+
+    def choose(self, remaining, now=None):
+        """mode for the next question; remaining includes the next question"""
+        left = self.deadline - (time.time() if now is None else now)
+        if len(self.times['normal']) < self.MIN_SAMPLES:
+            return 'fast' if left < remaining * self.FLOOR_SEC else 'normal'
+        normal, fast = self.estimate('normal') * self.SAFETY, self.estimate('fast') * self.SAFETY
+        return 'normal' if left - normal >= (remaining - 1) * fast else 'fast'
+
+
 def load_progress(path):
     """rows saved by an earlier (interrupted) run; [] if missing or unreadable"""
     if not os.path.exists(path):
@@ -459,12 +511,20 @@ class RAGSystem:
         diff = None
         if qtype == 'yesno':
             diff = self.yes_no_diff(p)
-            ans = 'yes' if diff > YES_MARGIN else 'no'
-        elif qtype == 'number':
-            ans = number_answer(self.generate(p, new_tokens))
-        else:
-            ans = maybe_number(shorten_text(clean_text(self.generate(p, new_tokens)), stem))
-        return qtype, ans, used, diff
+            return qtype, ('yes' if diff > YES_MARGIN else 'no'), used, diff
+        raw = self.generate(p, new_tokens)
+        if is_not_found(raw, qtype) and not fast:
+            # every contest answer IS in some document: look again with more chunks before giving up
+            more = self.retrieve(stem, k=K_RETRY)
+            raw2 = self.generate(self.build_prompt(ctx(more), stem, qtype), new_tokens)
+            if not is_not_found(raw2, qtype):
+                raw, used = raw2, more
+        if is_not_found(raw, qtype):
+            # number -> '0'; text -> '' scores 1/(1+2)=0.33, better than a long wrong phrase (~0.1)
+            return qtype, ('0' if qtype == 'number' else ''), used, diff
+        if qtype == 'number':
+            return qtype, number_answer(raw), used, diff
+        return qtype, maybe_number(shorten_text(clean_text(raw), stem)), used, diff
 
     @staticmethod
     def pick_doc_id(used):
@@ -492,15 +552,16 @@ class RAGSystem:
         todo = [i for i in range(len(qdf)) if i not in answers]
         print(f'{len(qdf)} questions, {len(todo)} to answer; must finish within '
               f'{(deadline - time.time()) / 60:.0f} min')
-        t0, fast = time.time(), False
+        budget, mode = TimeBudget(deadline), 'normal'
         for j, i in enumerate(todo):
             q = qdf[q_col][i]
-            if not fast and j >= 1:                       # deadline guard (emergency only)
-                projected = time.time() + (len(todo) - j) * (time.time() - t0) / j
-                if projected > deadline:
-                    fast = True
-                    print(f'!!! projected finish {(projected - deadline) / 60:.0f} min past the deadline '
-                          f'-> FAST MODE for the last {len(todo) - j} questions')
+            new_mode = budget.choose(len(todo) - j)       # re-decided before every question
+            if new_mode != mode:
+                print(f'--- switching to {new_mode.upper()} mode: {len(todo) - j} questions left, '
+                      f'{(deadline - time.time()) / 60:.0f} min to the deadline')
+                mode = new_mode
+            fast = mode == 'fast'
+            t_q = time.time()
             try:
                 qt, a, used, _ = self.answer_question(q, fast=fast)
                 doc = self.pick_doc_id(used)
@@ -512,6 +573,7 @@ class RAGSystem:
                 except Exception:
                     doc = -1
                 print(f'{i}: ERROR {e!r} -> fallback')
+            budget.record(mode, time.time() - t_q)
             answers[i], docs[i], qtexts[i] = a, doc, q
             save_csv(pd.DataFrame({'idx': list(answers), 'answer': list(answers.values()),
                                    'doc': [docs[k] for k in answers],
